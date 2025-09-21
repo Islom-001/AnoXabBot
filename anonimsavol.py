@@ -1,10 +1,9 @@
-import os
 import sqlite3
 import base64
 import json
 import re
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MessageEntity, Poll
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, MessageEntity, Poll, User
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import telegram.error
 import html
@@ -75,11 +74,43 @@ def init_db():
         referrer_id INTEGER, referred_id INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (referrer_id, referred_id)
     )''')
+
+    # Referral visits (new table for tracking visits, not just unique referrals)
+    cursor.execute('''CREATE TABLE IF NOT EXISTS referral_visits (
+        referrer_id INTEGER, visitor_id INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # Settings jadvali qo'shildi
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT
+    )''')
+    
+    # Dastlabki qiymatni o'rnatish, agar mavjud bo'lmasa
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('notify_blocks', 'on')")
     
     conn.commit()
     conn.close()
 
 init_db()
+
+# Bloklash bildirishnomasini yoqilganligini tekshirish funksiyasi
+def is_notify_blocks_enabled():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'notify_blocks'")
+        row = cursor.fetchone()
+        return row['value'] == 'on' if row else True  # Default: on
+
+# Bloklash bildirishnomasini toggle qilish
+def toggle_notify_blocks():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'notify_blocks'")
+        row = cursor.fetchone()
+        new_value = 'off' if row and row['value'] == 'on' else 'on'
+        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('notify_blocks', ?)", (new_value,))
+        conn.commit()
+    return new_value
 
 def encode_user_id(uid: int) -> str:
     return base64.b64encode(str(uid).encode()).decode()
@@ -222,6 +253,25 @@ def serialize_entity(entity) -> dict:
         "custom_emoji_id": getattr(entity, "custom_emoji_id", None)
     }
 
+def deserialize_entities(entities):
+    if not entities:
+        return None
+    result = []
+    for ent_dict in entities:
+        user_id = ent_dict.pop('user', None)
+        entity = MessageEntity(
+            type=ent_dict['type'],
+            offset=ent_dict['offset'],
+            length=ent_dict['length'],
+            url=ent_dict.get('url', None),
+            language=ent_dict.get('language', None),
+            custom_emoji_id=ent_dict.get('custom_emoji_id', None)
+        )
+        if user_id:
+            entity.user = User(id=user_id, first_name='', is_bot=False)
+        result.append(entity)
+    return result
+
 def serialize_poll(poll: Poll) -> dict:
     return {
         "question": poll.question,
@@ -264,7 +314,8 @@ async def set_bot_commands(context: ContextTypes.DEFAULT_TYPE):
         BotCommand(command="lang", description="🏳️ Bot tilini tanlash"),
         BotCommand(command="mystats", description="📊 Profil statistikangizni ko'rish"),
         BotCommand(command="blacklist", description="📜 Qora ro‘yxatni ko'rish "),
-        BotCommand(command="url", description="🔗 Referal linkni o'zgartirish")
+        BotCommand(command="url", description="🔗 Referal linkni o'zgartirish"),
+        BotCommand(command="help", description="❓ Yordam"),
     ]
     await context.bot.set_my_commands(commands)
 
@@ -326,21 +377,27 @@ translations = {
         'error_id': "Xatolik! ID noto‘g‘ri bo‘lishi mumkin.",
         'warn_message': "<b>Ogohlantirish! Ustingizdan shikoyat tushdi, yana takrorlansa bloklanishingiz mumkin!</b>",
         'lang_prompt': "Bot qaysi tilda ishlashini tanlang",
-        'mystats': "<b>📌 Profil statistikasi</b>\n\n<b>Bugun:</b>\n<blockquote>💬 Xabarlar: {today_messages}\n👀 Link orqali o‘tishlar: {today_referrals}\n⭐️ Mashhurlik: {popularity_rank} o‘rin</blockquote>\n\n<b>Umumiy:</b>\n<blockquote>💬 Xabarlar: {total_messages}\n👀 Link orqali o‘tishlar: {total_referrals}\n⭐️ Mashhurlik: {popularity_rank} o‘rin</blockquote>\n\n⭐️ Mashhurlik darajasini ko‘tarish uchun shaxsiy linkingizni tarqating:\n👉 {ref_link}",
+        'mystats': "<b>📌 Profil statistikasi</b>\n\n<b>Bugun:</b>\n<blockquote>💬 Sizga kelgan xabarlar: {today_messages}\n👀 Bugun havolangizdan foydalanganlar: {today_referrals}</blockquote>\n\n<b>Umumiy:</b>\n<blockquote>💬 Sizga kelgan xabarlar: {total_messages}\n👀 Jami havolangizdan foydalanganlar: {total_referrals}</blockquote>\n<blockquote>⭐️ Mashhurlik: {popularity_rank} o‘rin</blockquote>\n\n<b>⭐️ Mashhurlik darajasini ko‘tarish uchun shaxsiy linkingizni tarqating:</b>\n👉 {ref_link}",
         'share_button': "Ulashish",
         'share_post': "Ushbu link orqali menga anonim xabar yuborishingiz mumkin😊\n\n👉🏻 {ref_link}",
         'media_error': "Media yuborishda xato yuz berdi, lekin matn yuborildi:\n\n",
-        'url_usage': "Iltimos, yangi linkni kiriting: /url <yangi_link>\nLink faqat kichik harflar, raqamlar va _ bo'lishi mumkin, 3-20 belgi.",
+        'url_usage': "<b>Iltimos, yangi linkni quyidagicha yozing:</b> <blockquote>/url yangi_link</blockquote>\n<blockquote>Link faqat kichik harflar, raqamlar va _ bo'lishi mumkin, 3-20 belgi.</blockquote>",
         'url_invalid': "Noto'g'ri link! Faqat kichik harflar, raqamlar va _ bo'lishi mumkin, 3-20 belgi.",
         'url_taken': "Bu link allaqachon band qilingan. Boshqasini tanlang.",
-        'url_set': "Yangi referal link muvaffaqiyatli o'rnatildi:\n\n{ref_link}\n\nEski link endi ishlamaydi.",
+        'url_set': "<b>Yangi referal link muvaffaqiyatli o'rnatildi✅</b>\n\n{ref_link}\n\n<blockquote>Eski link endi ishlamaydi.</blockquote>",
         'top_users_title': "📊 TOP 30 Mashhur Foydalanuvchilar (Referrals bo'yicha):\n\n",
         'top_users_item': "{rank}. <a href=\"tg://user?id={id}\">{first_name}</a> (@{username}) ID: <code>{id}</code> Referrals: {cnt}\n",
         'unknown': "Noma'lum",
         'user_info_prompt': "Foydalanuvchi ID sini kiriting:",
         'user_not_found': "Foydalanuvchi topilmadi.",
         'user_info': "<b>Foydalanuvchi Ma'lumotlari:</b>\n\nIsm: <a href=\"tg://user?id={id}\">{first_name}</a>\nUsername: @{username}\nReferallardan ro'yxatdan o'tganlar: {referrals}\nAnonim xabarlar qabul qilgan: {messages}\nBloklaganlar soni: {blocks}\nMashhurlik reytingi: {rank} o'rin",
-        'not_subscribed_alert': "Hali kanallarga obuna bo'lmagansiz!"
+        'not_subscribed_alert': "Hali kanallarga obuna bo'lmagansiz!",
+        'notify_blocks_toggle': "Bloklash bildirishnomalari {status} qilindi.",
+        'insufficient_referrals': "Sizda yetarli referral yo'q (kamida 5 ta kerak). Referral jalb qiling va qayta urinib ko'ring.",
+        'congrats_referrals': "Tabriklaymiz 😊. Siz kamida 5ta odam taklif qilgansiz, endi referal havolangizni o'zgartirishingiz mumkin.",
+        'prohibited_content': "<b>Bunday xabarni yuborish taqiqlangan!</b>",
+        'broadcast_ask_media': "Matnga media qo'shmoqchimisiz?",
+        'help_message': "Botda - xabardan tashqari rasm, video va ovozli xabar yuborish mumkin ✅\n<b>.apk fayllar, har xil havolalar, karta raqam, kontakt va videoxabar yuborish taqiqlangan.</b>\n\nSizga kelgan anonim xabarlarga odatdagi chatlar kabi <b>reply</b> qilib (chapga surib) anonim javob berishingiz mumkin.\n\nHavolani oʻzgartirmoqchi boʻlganingizda, bot sizga bergan birinchi havoladan kamida 5ta doʻstlaringiz foydalansa siz havolani oʻzgartira olishingiz mumkin. Buning uchun botga <b>/url yangihavola</b> kabi buyruq joʻnatishingiz kerak.",  # Placeholder for help text
     },
     'en': {
         'banned': "You are banned from using the bot.",
@@ -395,21 +452,27 @@ translations = {
         'error_id': "Error! ID may be invalid.",
         'warn_message': "<b>Warning! A complaint was filed against you, repeat may lead to ban!</b>",
         'lang_prompt': "Select the language for the bot",
-        'mystats': "<b>📌 Profile Statistics</b>\n\n<b>Today:</b>\n<blockquote>💬 Messages: {today_messages}\n👀 Link visits: {today_referrals}\n⭐️ Popularity: {popularity_rank} place</blockquote>\n\n<b>Total:</b>\n<blockquote>💬 Messages: {total_messages}\n👀 Link visits: {total_referrals}\n⭐️ Popularity: {popularity_rank} place</blockquote>\n\n⭐️ To increase popularity, share your personal link:\n👉 {ref_link}",
+        'mystats': "<b>📌 Profile Statistics</b>\n\n<b>Today:</b>\n<blockquote>💬 Messages you received: {today_messages}\n👀 Users who used your link today: {today_referrals}</blockquote>\n\n<b>Total:</b>\n<blockquote>💬 Messages you received: {total_messages}\n👀 Total users who used your link: {total_referrals}</blockquote>\n<blockquote>⭐️ Popularity: {popularity_rank} place</blockquote>\n\n<b>⭐️ To increase popularity, share your personal link:</b>\n👉 {ref_link}",
         'share_button': "Share",
         'share_post': "You can send me an anonymous message via this link😊\n\n👉🏻 {ref_link}",
         'media_error': "Error sending media, but text sent:\n\n",
-        'url_usage': "Please enter new link: /url <new_link>\nLink can only contain lowercase letters, numbers and _, 3-20 characters.",
+        'url_usage': "<b>Please write the new link as follows:</b> <blockquote>/url new_link</blockquote>\n<blockquote>Link can only contain lowercase letters, numbers and _, 3-20 characters.</blockquote>",
         'url_invalid': "Invalid link! Only lowercase letters, numbers and _ allowed, 3-20 characters.",
         'url_taken': "This link is already taken. Choose another.",
-        'url_set': "New referral link set successfully:\n\n{ref_link}\n\nOld link no longer works.",
+        'url_set': "<b>New referral link set successfully✅</b>\n\n{ref_link}\n\n<blockquote>Old link no longer works.</blockquote>",
         'top_users_title': "📊 TOP 30 Popular Users (by Referrals):\n\n",
         'top_users_item': "{rank}. <a href=\"tg://user?id={id}\">{first_name}</a> (@{username}) ID: <code>{id}</code> Referrals: {cnt}\n",
         'unknown': "Unknown",
         'user_info_prompt': "Enter user ID:",
         'user_not_found': "User not found.",
         'user_info': "<b>User Info:</b>\n\nName: <a href=\"tg://user?id={id}\">{first_name}</a>\nUsername: @{username}\nReferrals registered: {referrals}\nAnonymous messages received: {messages}\nBlocked count: {blocks}\nPopularity rank: {rank}",
-        'not_subscribed_alert': "You haven't subscribed to the channels yet!"
+        'not_subscribed_alert': "You haven't subscribed to the channels yet!",
+        'notify_blocks_toggle': "Block notifications {status}.",
+        'insufficient_referrals': "You don't have enough referrals (at least 5 required). Invite more and try again.",
+        'congrats_referrals': "Congratulations 😊. You have invited at least 5 people, now you can change your referral link.",
+        'prohibited_content': "<b>Sending such a message is prohibited!</b>",
+        'broadcast_ask_media': "Do you want to add media to the text?",
+        'help_message': "In the bot, besides messages, you can send photos, videos, and voice messages ✅\n<b>.apk files, various links, card numbers, contacts, and video messages are prohibited.</b>\n\nYou can reply anonymously to the anonymous messages you receive, just like in regular chats, by using <b>reply</b> (swipe left).\n\nIf you want to change the link, you can only do so after at least 5 of your friends have used the first link provided by the bot. To do this, you need to send the bot a command like <b>/url newlink</b>.",  # Placeholder for help text
     },
     'ru': {
         'banned': "Вы заблокированы в боте.",
@@ -464,21 +527,27 @@ translations = {
         'error_id': "Ошибка! ID может быть недействительным.",
         'warn_message': "<b>Предупреждение! На вас поступила жалоба, повторение может привести к бану!</b>",
         'lang_prompt': "Выберите язык для бота",
-        'mystats': "<b>📌 Статистика профиля</b>\n\n<b>Сегодня:</b>\n<blockquote>💬 Сообщения: {today_messages}\n👀 Посещения по ссылке: {today_referrals}\n⭐️ Популярность: {popularity_rank} место</blockquote>\n\n<b>Всего:</b>\n<blockquote>💬 Сообщения: {total_messages}\n👀 Посещения по ссылке: {total_referrals}\n⭐️ Популярность: {popularity_rank} место</blockquote>\n\n⭐️ Чтобы повысить популярность, распространяйте свою личную ссылку:\n👉 {ref_link}",
+        'mystats': "<b>📌 Статистика профиля</b>\n\n<b>Сегодня:</b>\n<blockquote>💬 Сообщения, которые вы получили: {today_messages}\n👀 Пользователи, воспользовавшиеся вашей ссылкой сегодня: {today_referrals}</blockquote>\n\n<b>Всего:</b>\n<blockquote>💬 Сообщения, которые вы получили: {total_messages}\n👀 Всего пользователей, воспользовавшихся вашей ссылкой: {total_referrals}</blockquote>\n<blockquote>⭐️ Популярность: {popularity_rank} место</blockquote>\n\n<b>⭐️ Чтобы повысить популярность, распространяйте свою личную ссылку:</b>\n👉 {ref_link}",
         'share_button': "Поделиться",
         'share_post': "Вы можете отправить мне анонимное сообщение по этой ссылке😊\n\n👉🏻 {ref_link}",
         'media_error': "Ошибка отправки медиа, но текст отправлен:\n\n",
-        'url_usage': "Пожалуйста, введите новый ссылку: /url <new_link>\nСсылка может содержать только строчные буквы, цифры и _, 3-20 символов.",
+        'url_usage': "<b>Пожалуйста, напишите новую ссылку следующим образом:</b> <blockquote>/url new_link</blockquote>\n<blockquote>Ссылка может содержать только строчные буквы, цифры и _, 3-20 символов.</blockquote>",
         'url_invalid': "Недействительная ссылка! Только строчные буквы, цифры и _ разрешены, 3-20 символов.",
         'url_taken': "Эта ссылка уже занята. Выберите другую.",
-        'url_set': "Новая реферальная ссылка успешно установлена:\n\n{ref_link}\n\nСтарая ссылка больше не работает.",
+        'url_set': "<b>Новая реферальная ссылка успешно установлена✅</b>\n\n{ref_link}\n\n<blockquote>Старая ссылка больше не работает.</blockquote>",
         'top_users_title': "📊 TOP 30 Популярных Пользователей (по Рефералам):\n\n",
         'top_users_item': "{rank}. <a href=\"tg://user?id={id}\">{first_name}</a> (@{username}) ID: <code>{id}</code> Рефералы: {cnt}\n",
         'unknown': "Неизвестно",
         'user_info_prompt': "Введите ID пользователя:",
         'user_not_found': "Пользователь не найден.",
         'user_info': "<b>Информация о Пользователе:</b>\n\nИмя: <a href=\"tg://user?id={id}\">{first_name}</a>\nUsername: @{username}\nЗарегистрировано по рефералам: {referrals}\nПолучено анонимных сообщений: {messages}\nЗаблокировано: {blocks}\nРанг популярности: {rank}",
-        'not_subscribed_alert': "Вы еще не подписаны на каналы!"
+        'not_subscribed_alert': "Вы еще не подписаны на каналы!",
+        'notify_blocks_toggle': "Уведомления о блокировках {status}.",
+        'insufficient_referrals': "У вас недостаточно рефералов (требуется минимум 5). Пригласите больше и попробуйте снова.",
+        'congrats_referrals': "Поздравляем 😊. Вы пригласили как минимум 5 человек, теперь вы можете изменить свою реферальную ссылку.",
+        'prohibited_content': "<b>Отправка такого сообщения запрещена!</b>",
+        'broadcast_ask_media': "Хотите добавить медиа к тексту?",
+        'help_message': "В боте, кроме сообщений, можно отправлять фото, видео и голосовые сообщения ✅\n<b>.apk файлы, различные ссылки, номера карт, контакты и видеосообщения отправлять запрещено.</b>\n\nНа анонимные сообщения, пришедшие вам, можно отвечать анонимно так же, как в обычных чатах, используя <b>reply</b> (свайп влево).\n\nЕсли вы захотите изменить ссылку, то сможете это сделать только после того, как минимум 5 ваших друзей воспользуются первой ссылкой, которую вы получили от бота. Для этого нужно отправить боту команду вида <b>/url newlink</b>.",  # Placeholder for help text
     }
 }
 
@@ -486,23 +555,38 @@ def get_translation(lang, key, **kwargs):
     text = translations.get(lang, translations['uz']).get(key, '')
     return text.format(**kwargs)
 
+def has_prohibited_content(content: str) -> bool:
+    # Telefon raqam: + bilan boshlangan raqamlar
+    if re.search(r'\+\d+', content):
+        return True
+    # Karta raqam: 16 ta ketma-ket raqam, bo'sh joylarni e'tiborsiz
+    cleaned_content = re.sub(r'\s+', '', content)
+    if re.search(r'\d{16}', cleaned_content):
+        return True
+    # Linklar: http/https yoki www bilan boshlangan, lekin @ bilan boshlanmagan
+    if re.search(r'(https?://|www\.)[^\s@]+', content):
+        return True
+    return False
+
 async def send_media_message(bot, chat_id, media_type, file_id, caption, text, reply_markup=None, entities=None, poll_data=None, lang='uz'):
     try:
-        caption_entities = [MessageEntity(**entity) for entity in (entities or [])] if entities else None
+        caption_entities = deserialize_entities(entities)
         if media_type == 'photo':
-            await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities, parse_mode=None)  # parse_mode olib tashlandi
+            await bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities)
         elif media_type == 'video':
-            await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities, parse_mode=None)
+            await bot.send_video(chat_id=chat_id, video=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities)
         elif media_type == 'document':
-            await bot.send_document(chat_id=chat_id, document=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities, parse_mode=None)
+            await bot.send_document(chat_id=chat_id, document=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities)
         elif media_type == 'sticker':
             await bot.send_sticker(chat_id=chat_id, sticker=file_id, reply_markup=reply_markup)
         elif media_type == 'audio':
-            await bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities, parse_mode=None)
+            await bot.send_audio(chat_id=chat_id, audio=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities)
         elif media_type == 'animation':
-            await bot.send_animation(chat_id=chat_id, animation=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities, parse_mode=None)
+            await bot.send_animation(chat_id=chat_id, animation=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities)
         elif media_type == 'voice':
-            await bot.send_voice(chat_id=chat_id, voice=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities, parse_mode=None)
+            await bot.send_voice(chat_id=chat_id, voice=file_id, caption=caption, reply_markup=reply_markup, caption_entities=caption_entities)
+        elif media_type == 'video_note':
+            await bot.send_video_note(chat_id=chat_id, video_note=file_id, reply_markup=reply_markup)
         elif media_type == 'poll':
             await bot.send_poll(
                 chat_id=chat_id,
@@ -514,11 +598,11 @@ async def send_media_message(bot, chat_id, media_type, file_id, caption, text, r
                 reply_markup=reply_markup
             )
         else:
-            entities_list = [MessageEntity(**entity) for entity in (entities or [])] if entities else None
-            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, entities=entities_list, parse_mode=None)  # parse_mode olib tashlandi
+            entities_list = deserialize_entities(entities)
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, entities=entities_list)
     except Exception as e:
         print(f"Media yuborishda xato: {e}")
-        await bot.send_message(chat_id=chat_id, text=get_translation(lang, 'media_error') + text, parse_mode=None)
+        await bot.send_message(chat_id=chat_id, text=get_translation(lang, 'media_error') + text)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -554,10 +638,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_user_banned(receiver_id):
                 await update.message.reply_text(get_translation(lang, 'user_banned'))
                 return
-            # Track referral
+            # Track referral visit (every time, even if not new)
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO referral_visits (referrer_id, visitor_id) VALUES (?, ?)", (receiver_id, user_id))
+                conn.commit()
+
+            # Track unique referral (as before)
             with get_db_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (receiver_id, user_id))
+                if cursor.rowcount > 0:
+                    cursor.execute("UPDATE users SET referrals = referrals + 1 WHERE id = ?", (receiver_id,))
                 conn.commit()
             add_user_to_db(user_id, lang, first_name, username)
             with get_db_connection() as conn:
@@ -579,9 +671,21 @@ async def url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(get_translation(lang, 'banned'))
         return
 
+    # Yangi cheklov: 5+ referral kerak
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT referrals FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        referrals = row['referrals'] if row else 0
+
+    if referrals < 5:
+        await update.message.reply_text(get_translation(lang, 'insufficient_referrals'))
+        return
+
     args = context.args
     if not args:
-        await update.message.reply_text(get_translation(lang, 'url_usage'))
+        await update.message.reply_text(get_translation(lang, 'congrats_referrals'))
+        await update.message.reply_text(get_translation(lang, 'url_usage'), parse_mode="HTML")
         return
 
     new_ref = args[0].lower()
@@ -642,10 +746,10 @@ async def mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Total messages received
         cursor.execute("SELECT COUNT(*) FROM messages WHERE receiver_id = ?", (user_id,))
         total_messages = cursor.fetchone()[0]
-        # Today referrals (link visits)
-        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND DATE(timestamp) = ?", (user_id, today))
+        # Today unique referral visitors (unique visitor_ids today)
+        cursor.execute("SELECT COUNT(DISTINCT visitor_id) FROM referral_visits WHERE referrer_id = ? AND DATE(timestamp) = ?", (user_id, today))
         today_referrals = cursor.fetchone()[0]
-        # Total referrals
+        # Total unique referrals (as before)
         cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
         total_referrals = cursor.fetchone()[0]
         # Popularity rank based on referrals
@@ -679,13 +783,17 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text(get_translation(lang, 'admin_only'))
         return
+    # Bloklash bildirishnomasi holatini olish
+    notify_status = "Yoqish" if is_notify_blocks_enabled() else "O'chirish"
+    notify_text = f"Bloklash bildirishnomalarini {notify_status}" if lang == 'uz' else f"Toggle block notifications {notify_status}" if lang == 'en' else f"Переключить уведомления о блокировках {notify_status}"
     keyboard = [
         [InlineKeyboardButton("Barchaga xabar yuborish" if lang == 'uz' else "Broadcast to all" if lang == 'en' else "Рассылка всем", callback_data="broadcast")],
         [InlineKeyboardButton("Forward qilish" if lang == 'uz' else "Forward" if lang == 'en' else "Переслать", callback_data="forward")],
         [InlineKeyboardButton("Kanalga aʼzo qilish" if lang == 'uz' else "Set channels" if lang == 'en' else "Установить каналы", callback_data="set_channel")],
         [InlineKeyboardButton("Kanalni o‘chirish" if lang == 'uz' else "Remove channels" if lang == 'en' else "Удалить каналы", callback_data="remove_channel")],
         [InlineKeyboardButton("TOP 30 Mashhurlar" if lang == 'uz' else "TOP 30 Popular" if lang == 'en' else "ТОП 30 Популярных", callback_data="top_users")],
-        [InlineKeyboardButton("Foydalanuvchi Ma'lumotlari" if lang == 'uz' else "User Info" if lang == 'en' else "Инфо Пользователя", callback_data="user_info")]
+        [InlineKeyboardButton("Foydalanuvchi Ma'lumotlari" if lang == 'uz' else "User Info" if lang == 'en' else "Инфо Пользователя", callback_data="user_info")],
+        [InlineKeyboardButton(notify_text, callback_data="toggle_notify_blocks")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(get_translation(lang, 'admin_panel'), reply_markup=reply_markup)
@@ -709,6 +817,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages_count = cursor.fetchone()[0]
     stats_text = get_translation(lang, 'stats', users_count=users_count, banned_users_count=banned_users_count, messages_count=messages_count)
     await update.message.reply_text(stats_text, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    lang = get_user_language(user_id)
+    await update.message.reply_text(get_translation(lang, 'help_message'), parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -786,12 +899,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif update.message.voice:
         media_type = 'voice'
         file_id = update.message.voice.file_id
+    elif update.message.video_note:
+        media_type = 'video_note'
+        file_id = update.message.video_note.file_id
     elif update.message.poll:
         media_type = 'poll'
         poll_data = serialize_poll(update.message.poll)
         text = update.message.poll.question  # For consistency
 
     if step == "send":
+        # Yangi taqiqlar
+        content_to_check = text + " " + caption
+        if update.message.contact or update.message.video_note or has_prohibited_content(content_to_check):
+            await update.message.reply_text(get_translation(lang, 'prohibited_content'), parse_mode="HTML")
+            return
+        
         receiver_id = int(data)
         if is_user_blocked(receiver_id, user_id):
             await update.message.reply_text(get_translation(lang, 'user_banned'))
@@ -821,11 +943,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        new_msg_text = get_translation(receiver_lang, 'new_message', text=text)
         if media_type == 'text':
-            entities_list = [MessageEntity(**entity) for entity in entities]
-            await context.bot.send_message(chat_id=receiver_id, text=get_translation(receiver_lang, 'new_message', text=text), reply_markup=reply_markup, entities=entities_list, parse_mode=None)
+            entities_list = deserialize_entities(entities)
+            await context.bot.send_message(chat_id=receiver_id, text=new_msg_text, reply_markup=reply_markup, entities=entities_list)
         else:
-            await send_media_message(context.bot, receiver_id, media_type, file_id, caption, get_translation(receiver_lang, 'new_message', text=text), reply_markup, entities, poll_data, receiver_lang)
+            full_caption = new_msg_text + "\n\n" + caption
+            prepended_length = len(new_msg_text) + 2
+            adjusted_entities = []
+            for ent in entities:
+                ent_copy = ent.copy()
+                ent_copy['offset'] += prepended_length
+                adjusted_entities.append(ent_copy)
+            await send_media_message(context.bot, receiver_id, media_type, file_id, full_caption, text, reply_markup, adjusted_entities, poll_data, receiver_lang)
 
         await update.message.reply_text(get_translation(lang, 'message_sent'))
         ref_link = get_ref_link(user_id)
@@ -834,11 +964,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif step == "reply":
         original_sender_id = int(data)
         sender_lang = get_user_language(original_sender_id)
+        reply_msg_text = get_translation(sender_lang, 'reply_message', text=text)
         if media_type == 'text':
-            entities_list = [MessageEntity(**entity) for entity in entities]
-            await context.bot.send_message(chat_id=original_sender_id, text=get_translation(sender_lang, 'reply_message', text=text), entities=entities_list, parse_mode=None)
+            entities_list = deserialize_entities(entities)
+            await context.bot.send_message(chat_id=original_sender_id, text=reply_msg_text, entities=entities_list)
         else:
-            await send_media_message(context.bot, original_sender_id, media_type, file_id, caption, get_translation(sender_lang, 'reply_message', text=text), None, entities, poll_data, sender_lang)
+            full_caption = reply_msg_text + "\n\n" + caption
+            prepended_length = len(reply_msg_text) + 2
+            adjusted_entities = []
+            for ent in entities:
+                ent_copy = ent.copy()
+                ent_copy['offset'] += prepended_length
+                adjusted_entities.append(ent_copy)
+            await send_media_message(context.bot, original_sender_id, media_type, file_id, full_caption, text, None, adjusted_entities, poll_data, sender_lang)
         await update.message.reply_text(get_translation(lang, 'reply_sent'))
         with get_db_connection() as conn:
             cursor = conn.cursor()
@@ -849,19 +987,88 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             await update.message.reply_text(get_translation(lang, 'admin_only'))
             return
+        if media_type == 'text':
+            # Faqat matn yuborilganda, media so'rash
+            broadcast_data = {
+                "media_type": media_type,
+                "file_id": file_id,
+                "caption": caption,
+                "message": text,
+                "entities": entities
+            }
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO sessions (user_id, step, data) VALUES (?, ?, ?)",
+                               (user_id, "broadcast_ask_media", json.dumps(broadcast_data)))
+                conn.commit()
+            yes_text = "Ha" if lang == 'uz' else "Yes" if lang == 'en' else "Да"
+            no_text = "Yo‘q" if lang == 'uz' else "No" if lang == 'en' else "Нет"
+            keyboard = [
+                [InlineKeyboardButton(yes_text, callback_data="broadcast_add_media")],
+                [InlineKeyboardButton(no_text, callback_data="broadcast_no_media")]
+            ]
+            await update.message.reply_text(get_translation(lang, 'broadcast_ask_media'), reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            # Media yuborilganda, oddiy jarayon
+            broadcast_data = {
+                "media_type": media_type,
+                "file_id": file_id,
+                "caption": caption,
+                "message": text,
+                "entities": entities
+            }
+            if media_type == 'poll':
+                broadcast_data["poll_data"] = poll_data
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO sessions (user_id, step, data) VALUES (?, ?, ?)",
+                               (user_id, "broadcast_ask_inline", json.dumps(broadcast_data)))
+                conn.commit()
+            yes_text = "Ha" if lang == 'uz' else "Yes" if lang == 'en' else "Да"
+            no_text = "Yo‘q" if lang == 'uz' else "No" if lang == 'en' else "Нет"
+            keyboard = [
+                [InlineKeyboardButton(yes_text, callback_data="broadcast_add_buttons")],
+                [InlineKeyboardButton(no_text, callback_data="broadcast_no_buttons")]
+            ]
+            await update.message.reply_text(get_translation(lang, 'broadcast_prompt'), reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif step == "broadcast_wait_media":
+        if not is_admin(user_id):
+            await update.message.reply_text(get_translation(lang, 'admin_only'))
+            return
+        if media_type == 'text':
+            await update.message.reply_text("Iltimos, media yuboring (rasm, video va h.k.).")
+            return
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT data FROM sessions WHERE user_id = ?", (user_id,))
+            session_data = json.loads(cursor.fetchone()["data"])
+        # Oldingi matnni captionga qo'shish
+        old_text = session_data["message"]
+        old_entities = session_data["entities"]
+        full_caption = old_text + "\n\n" + caption
+        prepended_length = len(old_text) + 2  # \n\n
+        adjusted_entities = old_entities.copy() if old_entities else []
+        for ent in adjusted_entities:
+            ent['offset'] = ent['offset']  # Old entities already for old_text
+        if entities:
+            for ent in entities:
+                ent_copy = ent.copy()
+                ent_copy['offset'] += prepended_length
+                adjusted_entities.append(ent_copy)
         broadcast_data = {
             "media_type": media_type,
             "file_id": file_id,
-            "caption": caption,
+            "caption": full_caption,
             "message": text,
-            "entities": entities
+            "entities": adjusted_entities
         }
         if media_type == 'poll':
             broadcast_data["poll_data"] = poll_data
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("INSERT OR REPLACE INTO sessions (user_id, step, data) VALUES (?, ?, ?)",
-                           (user_id, "broadcast_ask_inline", json.dumps(broadcast_data)))
+            cursor.execute("UPDATE sessions SET step = ?, data = ? WHERE user_id = ?",
+                           ("broadcast_ask_inline", json.dumps(broadcast_data), user_id))
             conn.commit()
         yes_text = "Ha" if lang == 'uz' else "Yes" if lang == 'en' else "Да"
         no_text = "Yo‘q" if lang == 'uz' else "No" if lang == 'en' else "Нет"
@@ -943,20 +1150,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         target_lang = get_user_language(target_id)
                         try:
                             if session_data["media_type"] == 'text':
-                                entities_list = [MessageEntity(**entity) for entity in session_data["entities"]]
+                                entities_list = deserialize_entities(session_data["entities"])
                                 await context.bot.send_message(
                                     chat_id=target_id,
                                     text=session_data["message"],
                                     entities=entities_list,
-                                    reply_markup=reply_markup,
-                                    parse_mode=None  # parse_mode olib tashlandi
+                                    reply_markup=reply_markup
                                 )
                             elif session_data["media_type"] == 'poll':
                                 await send_media_message(context.bot, target_id, session_data["media_type"], None, None, None, reply_markup, None, session_data.get("poll_data"), target_lang)
                             else:
                                 await send_media_message(context.bot, target_id, session_data["media_type"], session_data["file_id"], session_data["caption"], session_data["message"], reply_markup, session_data["entities"], None, target_lang)
                             success_count += 1
-                        except Exception:
+                        except Exception as e:
+                            print(f"Broadcast xato: {e} for user {target_id}")
                             failed_count += 1
                 await update.message.reply_text(get_translation(lang, 'broadcast_sent', success=success_count, failed=failed_count))
 
@@ -1108,9 +1315,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_lang = data.split("_")[1]
         update_user_language(user_id, new_lang)
         await query.message.edit_text(f"Til {new_lang.upper()} ga o'zgartirildi." if lang == 'uz' else f"Language set to {new_lang.upper()}" if lang == 'en' else f"Язык установлен на {new_lang.upper()}")
-        return
 
-    if data == "check_membership":
+    elif data == "check_membership":
         if await check_channel_membership(user_id, context):
             await query.message.delete()
             await context.bot.send_message(chat_id=user_id, text=get_translation(lang, 'thanks_subscribed'))
@@ -1131,10 +1337,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if is_user_banned(receiver_id):
                                 await context.bot.send_message(chat_id=user_id, text=get_translation(lang, 'user_banned'))
                                 return
-                            # Track referral again if needed
+                            # Track referral visit (every time, even if not new)
+                            with get_db_connection() as conn:
+                                cursor = conn.cursor()
+                                cursor.execute("INSERT INTO referral_visits (referrer_id, visitor_id) VALUES (?, ?)", (receiver_id, user_id))
+                                conn.commit()
+
+                            # Track unique referral (as before)
                             with get_db_connection() as conn:
                                 cursor = conn.cursor()
                                 cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (receiver_id, user_id))
+                                if cursor.rowcount > 0:
+                                    cursor.execute("UPDATE users SET referrals = referrals + 1 WHERE id = ?", (receiver_id,))
                                 conn.commit()
                             add_user_to_db(user_id, lang, first_name, username)
                             with get_db_connection() as conn:
@@ -1163,18 +1377,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message = cursor.fetchone()
         if message:
             block_user(user_id, message["sender_id"])
-            report_lang = get_user_language(ADMIN_ID)
-            report_text = (
-                f"📢 *{get_translation(report_lang, 'block')}*\n\n"
-                f"👤 *Bloklovchi*:\n  Ism: [{message['receiver_name']}](tg://user?id={message['receiver_id']})\n"
-                f"  Username: @{message['receiver_username']}\n  ID: `{message['receiver_id']}`\n\n"
-                f"👤 *Bloklangan*:\n  Ism: [{message['sender_name']}](tg://user?id={message['sender_id']})\n"
-                f"  Username: @{message['sender_username']}\n  ID: `{message['sender_id']}`\n\n"
-                f"📜 *Xabar*:\n{message['text']}\n"
-            )
-            await context.bot.send_message(chat_id=ADMIN_ID, text=report_text, parse_mode="Markdown")
-            if message['media_type'] != 'text':
-                await send_media_message(context.bot, ADMIN_ID, message['media_type'], message['file_id'], message['caption'], message['text'], lang=report_lang)
+            if is_notify_blocks_enabled():
+                report_lang = get_user_language(ADMIN_ID)
+                report_text = (
+                    f"📢 *{get_translation(report_lang, 'block')}*\n\n"
+                    f"👤 *Bloklovchi*:\n  Ism: [{message['receiver_name']}](tg://user?id={message['receiver_id']})\n"
+                    f"  Username: @{message['receiver_username']}\n  ID: `{message['receiver_id']}`\n\n"
+                    f"👤 *Bloklangan*:\n  Ism: [{message['sender_name']}](tg://user?id={message['sender_id']})\n"
+                    f"  Username: @{message['sender_username']}\n  ID: `{message['sender_id']}`\n\n"
+                    f"📜 *Xabar*:\n{message['text']}\n"
+                )
+                await context.bot.send_message(chat_id=ADMIN_ID, text=report_text, parse_mode="Markdown")
+                if message['media_type'] != 'text':
+                    await send_media_message(context.bot, ADMIN_ID, message['media_type'], message['file_id'], message['caption'], message['text'], lang=report_lang)
             keyboard = [[InlineKeyboardButton(get_translation(lang, 'unblock'), callback_data=f"unblock_{message['sender_id']}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.message.reply_text(get_translation(lang, 'block_sent'), reply_markup=reply_markup, parse_mode="HTML")
@@ -1214,6 +1429,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
         await query.message.reply_text(get_translation(lang, 'forward_message_prompt'))
 
+    elif data == "broadcast_add_media":
+        if not is_admin(user_id):
+            await query.message.reply_text(get_translation(lang, 'admin_only'))
+            return
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE sessions SET step = ? WHERE user_id = ?", ("broadcast_wait_media", user_id))
+            conn.commit()
+        await query.message.reply_text("Iltimos, media yuboring (rasm, video va h.k.).")
+
+    elif data == "broadcast_no_media":
+        if not is_admin(user_id):
+            await query.message.reply_text(get_translation(lang, 'admin_only'))
+            return
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE sessions SET step = ? WHERE user_id = ?", ("broadcast_ask_inline", user_id))
+            conn.commit()
+        yes_text = "Ha" if lang == 'uz' else "Yes" if lang == 'en' else "Да"
+        no_text = "Yo‘q" if lang == 'uz' else "No" if lang == 'en' else "Нет"
+        keyboard = [
+            [InlineKeyboardButton(yes_text, callback_data="broadcast_add_buttons")],
+            [InlineKeyboardButton(no_text, callback_data="broadcast_no_buttons")]
+        ]
+        await query.message.reply_text(get_translation(lang, 'broadcast_prompt'), reply_markup=InlineKeyboardMarkup(keyboard))
+
     elif data == "broadcast_add_buttons":
         if not is_admin(user_id):
             await query.message.reply_text(get_translation(lang, 'admin_only'))
@@ -1242,12 +1483,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_lang = get_user_language(target_id)
                 try:
                     if session_data["media_type"] == 'text':
-                        entities_list = [MessageEntity(**entity) for entity in session_data["entities"]]
+                        entities_list = deserialize_entities(session_data["entities"])
                         await context.bot.send_message(
                             chat_id=target_id,
                             text=session_data["message"],
-                            entities=entities_list,
-                            parse_mode=None  # parse_mode olib tashlandi
+                            entities=entities_list
                         )
                     elif session_data["media_type"] == 'poll':
                         await send_media_message(context.bot, target_id, session_data["media_type"], None, None, None, None, None, session_data.get("poll_data"), target_lang)
@@ -1310,6 +1550,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                            (user_id, "get_user_id", json.dumps({})))
             conn.commit()
         await query.message.reply_text(get_translation(lang, 'user_info_prompt'))
+
+    elif data == "toggle_notify_blocks":
+        if not is_admin(user_id):
+            await query.message.reply_text(get_translation(lang, 'admin_only'))
+            return
+        new_status = toggle_notify_blocks()
+        status_text = (
+            "yoqildi" if new_status == 'on' else "o'chirildi"
+        ) if lang == 'uz' else (
+            "enabled" if new_status == 'on' else "disabled"
+        ) if lang == 'en' else (
+            "включены" if new_status == 'on' else "отключены"
+        )
+        await query.message.reply_text(get_translation(lang, 'notify_blocks_toggle', status=status_text))
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1388,6 +1642,7 @@ def main():
     app.add_handler(CommandHandler("mystats", mystats))
     app.add_handler(CommandHandler("blacklist", blacklist))
     app.add_handler(CommandHandler("url", url_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("ban", ban))
